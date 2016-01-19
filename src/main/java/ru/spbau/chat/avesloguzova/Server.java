@@ -8,7 +8,6 @@ import java.io.*;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
-import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -21,6 +20,7 @@ import java.util.stream.Collectors;
 import static ru.spbau.chat.commons.protocol.ChatProtocol.Message.parseDelimitedFrom;
 
 public class Server implements Closeable {
+    private static final int BUFFFER_CAPACITY = 1 << 10;
     private static final Logger LOG = Logger.getLogger(Server.class.getName());
 
     private final AsynchronousChannelGroup channelGroup;
@@ -46,7 +46,7 @@ public class Server implements Closeable {
     }
 
     private void startReadingNewMessage(AsynchronousSocketChannel channel) {
-        ByteBuffer sizeBuffer = ByteBuffer.allocate(32);
+        ByteBuffer sizeBuffer = ByteBuffer.allocate(BUFFFER_CAPACITY);
         channel.read(sizeBuffer, channel, new ReadMessageHandler(sizeBuffer
         ));
     }
@@ -71,37 +71,19 @@ public class Server implements Closeable {
     private void handleCommand(ProtocolStringList strings, AsynchronousSocketChannel channel) {
         commandExecutor.submit((Runnable) () -> {
             String command = buildCommand(strings);
-            List<String> result = runCommand(command);
-            writeCommandResult(result,channel);
+            List<String> result = ChatUtils.runCommand(command);
+            writeCommandResult(result, channel);
         });
 
 
     }
-    private static List<String> runCommand(String command) {
-        try {
-            Process process = Runtime.getRuntime().exec(command);
-            process.waitFor();
 
-            try (BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-               return bufferedReader.lines().collect(Collectors.toList());
-            }
-        } catch (IOException | InterruptedException e) {
-           return Collections.singletonList(e.getMessage());
-        }
-    }
     private void writeCommandResult(List<String> result, AsynchronousSocketChannel channel) {
         ChatProtocol.Message message = ChatProtocol.Message.newBuilder()
                 .addAllText(result)
                 .setType(ChatProtocol.Message.Type.COMMAND)
                 .build();
-        sendMessage(message,channel);
-    }
-
-
-
-    private static String buildCommand(ProtocolStringList strings) {
-
-        return strings.stream().collect(Collectors.joining(System.lineSeparator()));
+        sendMessage(message, channel);
     }
 
     private void shareMessage(ChatProtocol.Message message, AsynchronousSocketChannel sourceChanel) {
@@ -123,6 +105,24 @@ public class Server implements Closeable {
         }
     }
 
+    private static String buildCommand(ProtocolStringList strings) {
+
+        return strings.stream().collect(Collectors.joining(System.lineSeparator()));
+    }
+
+    public static void main(String[] args) {
+
+        try (Server server = new Server(Integer.parseInt(args[0]), 20053)) {
+            while (!Thread.interrupted()) {
+                server.accept();
+            }
+        } catch (IOException e) {
+            LOG.severe("Server is closed. " + e.getMessage());
+        } catch (NumberFormatException e) {
+            System.out.println("usage: Server <pool_size>");
+        }
+    }
+
     private class ReadMessageHandler extends ChatMessageHandler {
 
         ReadMessageHandler(ByteBuffer buffer) {
@@ -136,10 +136,27 @@ public class Server implements Closeable {
                 handleMessage(message, channel);
                 startReadingNewMessage(channel);
             } catch (IOException e) {
-                buffer.position(0);
-                channel.read(buffer, channel, this);
+                ByteBuffer byteBuffer = ByteBuffer.allocate(BUFFFER_CAPACITY);
+                channel.read(byteBuffer, channel, new BufferedReadMessageHandler(buffer, byteBuffer));
             }
         }
+    }
+
+    private class BufferedReadMessageHandler extends ReadMessageHandler {
+
+        private ByteBuffer oldBuffer;
+
+        BufferedReadMessageHandler(ByteBuffer oldBuffer, ByteBuffer buffer) {
+            super(buffer);
+            this.oldBuffer = oldBuffer;
+        }
+
+        @Override
+        protected void handleResult(Integer result, AsynchronousSocketChannel channel) {
+            buffer = ChatUtils.concatBuffers(oldBuffer, buffer);
+            super.handleResult(result, channel);
+        }
+
     }
 
     private class WriteMessageHandler extends ChatMessageHandler {
@@ -158,11 +175,10 @@ public class Server implements Closeable {
     }
 
     private abstract class ChatMessageHandler implements CompletionHandler<Integer, AsynchronousSocketChannel> {
-        protected final ByteBuffer buffer;
+        protected ByteBuffer buffer;
 
         ChatMessageHandler(ByteBuffer buffer) {
             this.buffer = buffer;
-
         }
 
         protected abstract void handleResult(Integer result, AsynchronousSocketChannel attachment);
@@ -179,20 +195,8 @@ public class Server implements Closeable {
         @Override
         public void failed(Throwable throwable, AsynchronousSocketChannel channel) {
             channels.remove(channel);
-            LOG.info("Some exception occurred while in I/O operation in chanel" + channel.toString() +
+            LOG.info("Some exception occurred while in I/O operation in chanel " + channel.toString() +
                     ". Maybe chanel was closed.");
-        }
-    }
-    public static void main(String[] args) {
-
-        try (Server server = new Server(Integer.parseInt(args[0]), 20053)) {
-            while (!Thread.interrupted()) {
-                server.accept();
-            }
-        } catch (IOException e) {
-            LOG.severe( "Server is closed. "+e.getMessage());
-        } catch (NumberFormatException e) {
-            System.out.println("usage: Server <pool_size>");
         }
     }
 }
